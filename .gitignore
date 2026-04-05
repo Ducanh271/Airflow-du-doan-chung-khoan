@@ -1,0 +1,13 @@
+# Bỏ qua môi trường ảo
+airflow-env/
+
+# Bỏ qua dữ liệu
+data/
+*.csv
+*.h5
+*.gz
+*.json
+
+# Bỏ qua file rác của Python
+__pycache__/
+*.pyc
