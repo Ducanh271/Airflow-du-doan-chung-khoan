@@ -1,37 +1,30 @@
-"""
-DAG TaskFlow API v4 - Hệ thống dự đoán chứng khoán tự động
-Phiên bản đã fix lỗi {{ ds }} và tối ưu cho Airflow 2.8.1
-"""
-
 from airflow.decorators import dag, task
 from airflow.models import Variable
 from datetime import datetime, timedelta
-from typing import cast
-
 import os
+import sys
+import logging
 
-# ====================== CẤU HÌNH ======================
-DATA_DIR = Variable.get(
-    "stock_data_dir",
-    default_var="/home/duckanh/airflow/data/stock"
-)
+# Cấu hình Root Logger cho Airflow bắt được
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
+sys.path.append(os.path.dirname(__file__))
+
+DATA_DIR = Variable.get("stock_data_dir", default_var="/home/duckanh/airflow/data/stock")
 TICKER = Variable.get("stock_ticker", default_var="DIG.VN")
-START_DATE_STR = "2023-01-01"
+START_DATE_STR = Variable.get("stock_start_date", default_var="2023-01-01")
+SEQ_LENGTH = int(Variable.get("stock_seq_length", default_var=60))
+DAYS_PREDICT = int(Variable.get("stock_days_predict", default_var=5))
 
-# Tạo thư mục dữ liệu
+# Lấy danh sách ngày nghỉ lễ từ Variable (dạng chuỗi cách nhau dấu phẩy)
+HOLIDAYS_STR = Variable.get("stock_holidays", default_var="2026-04-30,2026-05-01,2026-09-02")
+HOLIDAYS_LIST = [h.strip() for h in HOLIDAYS_STR.split(',')]
+
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# Đường dẫn các file
-RAW_FILE    = os.path.join(DATA_DIR, "raw.csv")
-PROC_FILE   = os.path.join(DATA_DIR, "processed.csv")
-MODEL_FILE  = os.path.join(DATA_DIR, "model.h5")
-SCALER_FILE = os.path.join(DATA_DIR, "scaler.gz")
-
-
 @dag(
-    dag_id="stock_automl_full_taskflow_v4",
-    description="Hệ thống học máy tự động dự đoán chứng khoán sử dụng LSTM + Inference",
+    dag_id="stock_automl_full_taskflow_v6",
+    description="Pipeline MLOps hoàn chỉnh: No Leakage, Logging Chuẩn, Config Variables",
     schedule="@daily",
     start_date=datetime(2025, 1, 1),
     catchup=False,
@@ -40,95 +33,56 @@ SCALER_FILE = os.path.join(DATA_DIR, "scaler.gz")
         "owner": "duckanh",
         "retries": 3,
         "retry_delay": timedelta(minutes=5),
-        "execution_timeout": timedelta(minutes=60),
+        "execution_timeout": timedelta(minutes=60), # Tăng lên 60p cho an toàn
     },
-    tags=["stock", "lstm", "mlops", "inference", "tttn"],
+    tags=["stock", "mlops", "tttn"],
 )
 def stock_prediction_pipeline():
 
-    # ==================== TASK 2.1: Thu thập dữ liệu ====================
     @task(task_id="ingestion_module", retries=5)
-    def collect_data_task(**context):           # <-- Thêm **context
+    def collect_data_task(**context):
         from modules.ingestion import collect_data
-        
-        # Lấy ngày thực tế từ Airflow Context
-        execution_date = context['ds']          # Ví dụ: '2026-04-05'
-        
-        print(f"--- Task: Thu thập dữ liệu {TICKER} đến ngày {execution_date} ---")
-        
-        success = collect_data(
-            ticker=TICKER,
-            start_date=START_DATE_STR,
-            end_date=execution_date,            # Truyền ngày thực tế
-            save_path=RAW_FILE
-        )
-        if not success:
-            raise ValueError(f"Thu thập dữ liệu cho {TICKER} thất bại!")
-        return RAW_FILE
+        ds = context['ds']
+        raw_file = os.path.join(DATA_DIR, f"raw_{ds}.csv")
+        if not collect_data(TICKER, START_DATE_STR, ds, raw_file): raise ValueError("Lỗi Ingestion")
+        return raw_file
 
-    # ==================== TASK 2.2: Xử lý dữ liệu ====================
     @task(task_id="processing_module")
-    def preprocess_task(raw_file):
-        from modules.processing import preprocess_and_sync
-        print("--- Task: Xử lý và đồng bộ dữ liệu ---")
-        success = preprocess_and_sync(
-            input_path=raw_file,
-            output_path=PROC_FILE,
-            scaler_path=SCALER_FILE
-        )
-        if not success:
-            raise ValueError("Xử lý dữ liệu thất bại!")
-        return PROC_FILE
+    def preprocess_task(raw_file, **context):
+        from modules.processing import preprocess_data
+        ds = context['ds']
+        proc_file = os.path.join(DATA_DIR, f"processed_{ds}.csv")
+        if not preprocess_data(raw_file, proc_file): raise ValueError("Lỗi Processing")
+        return proc_file
 
-    # ==================== TASK 2.3: Huấn luyện mô hình ====================
     @task(task_id="modeling_module")
-    def modeling_task(processed_file):
+    def modeling_task(processed_file, **context):
         from modules.modeling import build_and_train
-        print("--- Task: Huấn luyện mô hình LSTM ---")
-        success = build_and_train(
-            data_path=processed_file,
-            model_path=MODEL_FILE
-        )
-        if not success:
-            raise ValueError("Huấn luyện mô hình thất bại!")
-        return MODEL_FILE
+        ds = context['ds']
+        model_file = os.path.join(DATA_DIR, f"model_{ds}.h5")
+        scaler_file = os.path.join(DATA_DIR, f"scaler_{ds}.gz")
+        if not build_and_train(processed_file, model_file, scaler_file, seq_length=SEQ_LENGTH): raise ValueError("Lỗi Modeling")
+        return {"model_path": model_file, "scaler_path": scaler_file}
 
-    # ==================== TASK 2.4: Đánh giá mô hình ====================
     @task(task_id="evaluation_module")
-    def evaluation_task(processed_file, model_file):
+    def evaluation_task(processed_file, model_artifacts):
         from modules.evaluation import evaluate_model
-        print("--- Task: Đánh giá mô hình ---")
-        success = evaluate_model(
-            data_path=processed_file,
-            model_path=model_file
-        )
-        if not success:
-            raise ValueError("Đánh giá mô hình thất bại!")
-        return "Evaluation completed"
+        if not evaluate_model(processed_file, model_artifacts['model_path'], model_artifacts['scaler_path'], seq_length=SEQ_LENGTH): raise ValueError("Lỗi Evaluation")
+        return True
 
-    # ==================== TASK 2.5: Dự báo tương lai ====================
     @task(task_id="inference_module")
-    def inference_task(processed_file, model_file):
+    def inference_task(processed_file, model_artifacts):
         from modules.inference import predict_future
-        print("--- Task: Dự báo giá 5 ngày tới ---")
-        results = predict_future(
-            model_path=model_file,
-            scaler_path=SCALER_FILE,
-            processed_data_path=processed_file,
-            days_to_predict=5,
-            seq_length=60
-        )
+        results = predict_future(TICKER, model_artifacts['model_path'], model_artifacts['scaler_path'], processed_file, holidays=HOLIDAYS_LIST, days_to_predict=DAYS_PREDICT, seq_length=SEQ_LENGTH)
+        if not results: raise ValueError("Lỗi Inference")
         return results
 
-    # ==================== XÂY DỰNG PIPELINE ====================
-    raw = collect_data_task()
+    # Pipeline
+    raw_path = collect_data_task()
+    proc_path = preprocess_task(raw_path)
+    artifacts = modeling_task(proc_path)
     
-    processed = preprocess_task(cast(str, raw))
-    model = modeling_task(cast(str, processed))
-    
-    evaluation_task(cast(str, processed), cast(str, model))
-    inference_task(cast(str, processed), cast(str, model))
+    evaluation_task(proc_path, artifacts)
+    inference_task(proc_path, artifacts)
 
-
-# Khởi tạo DAG
 stock_prediction_pipeline()

@@ -1,18 +1,21 @@
 import pandas as pd
-from sklearn.preprocessing import MinMaxScaler
-import joblib
+import logging
 
-def preprocess_and_sync(input_path, output_path, scaler_path):
-    print("--- Module 2.2: Đang xử lý và đồng bộ dữ liệu ---")
-    df = pd.read_csv(input_path)
-    # Lấy giá đóng cửa (Close)
-    data = df[['Close']].values
-    
-    scaler = MinMaxScaler(feature_range=(0, 1))
-    scaled_data = scaler.fit_transform(data)
-    
-    # Lưu scaler để dùng cho bước dự báo sau này (đồng bộ hóa)
-    joblib.dump(scaler, scaler_path)
-    
-    pd.DataFrame(scaled_data).to_csv(output_path, index=False)
-    return True
+logger = logging.getLogger(__name__)
+
+def preprocess_data(input_path: str, output_path: str) -> bool:
+    logger.info("--- Module 2.2: Xử lý làm sạch dữ liệu (Chưa Scale) ---")
+    try:
+        df = pd.read_csv(input_path)
+        
+        # Chỉ giữ lại cột Ngày và Giá đóng cửa
+        # Tuyệt đối không Scale ở đây để chống Data Leakage
+        data = df[['Date', 'Close']]
+        
+        data.to_csv(output_path, index=False)
+        logger.info(f"✅ Xử lý hoàn tất -> {output_path}")
+        
+        return True
+    except Exception as e:
+        logger.error(f"❌ Lỗi xử lý dữ liệu: {e}")
+        return False
